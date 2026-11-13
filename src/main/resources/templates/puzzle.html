@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="es" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Stf-Puzzle Simplified Version</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: "Segoe UI", Calibri, Arial, sans-serif;
+            margin: 0;
+            padding: 24px 12px 48px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            color: #222;
+        }
+        h1 { font-size: 1.6rem; font-weight: 600; margin: 0 0 14px; }
+
+        /* ----- Panel de configuracion ----- */
+        .panel {
+            width: 340px;
+            border: 2px solid #000;
+            background: #f8f9fa;
+            padding: 0 12px 14px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+        }
+        .panel img {
+            width: 150px;
+            height: 150px;
+            object-fit: cover;
+            display: block;
+        }
+        .fila { display: flex; gap: 10px; width: 100%; }
+        input[type="color"] {
+            width: 74px; height: 44px; padding: 3px;
+            border: 1px solid #888; border-radius: 3px; background: #fff; cursor: pointer;
+        }
+        input[type="text"] {
+            flex: 1; height: 44px; font-size: 1.2rem; padding: 0 8px;
+            border: 1px solid #aaa; border-radius: 3px;
+        }
+        input[type="text"].invalido { border-color: #c0392b; outline-color: #c0392b; }
+        .btn {
+            background: #3f8a5c; color: #fff; border: none; border-radius: 6px;
+            padding: 10px 20px; font-size: 1.15rem; cursor: pointer;
+        }
+        .btn:hover { background: #33734c; }
+        .btn:disabled { opacity: .6; cursor: wait; }
+        .error { color: #c0392b; font-size: .9rem; min-height: 1em; margin: 0; text-align: center; }
+        #btnIniciar { margin-top: 16px; }
+
+        /* ----- Tablero ----- */
+        #zonaJuego { margin-top: 18px; display: flex; flex-direction: column; align-items: center; }
+        #tablero { display: grid; border: 3px solid #000; }
+        .casilla {
+            border: 1px solid #000;
+            background-repeat: no-repeat;
+            background-origin: border-box;
+        }
+        .casilla.movible { cursor: pointer; }
+        .casilla.movible:hover { filter: brightness(1.08); }
+        .casilla.no-valida { animation: sacudir .3s; }
+        @keyframes sacudir {
+            25% { transform: translateX(-4px); }
+            75% { transform: translateX(4px); }
+        }
+        #mensaje { font-weight: 700; font-size: 1.25rem; margin: 10px 0 0; min-height: 1.5em; }
+        [hidden] { display: none !important; }
+    </style>
+</head>
+<body>
+
+<h1>Stf-Puzzle Simplified Version</h1>
+
+<!-- Configuracion del juego -->
+<div id="panel" class="panel">
+    <img id="preview" src="/bulbasaur.png" th:src="@{/bulbasaur.png}" alt="Personaje">
+    <div class="fila">
+        <input type="color" id="color" value="#ffffff" title="Color del tablero">
+        <input type="text" id="dimension" placeholder="3x3" autocomplete="off"
+               title="Dimensiones del tablero en formato NxN">
+    </div>
+    <p id="errorDim" class="error"></p>
+    <input type="file" id="archivo" accept=".jpg,.jpeg,image/jpeg" hidden>
+    <button type="button" id="btnSeleccionar" class="btn">Seleccionar Personaje</button>
+    <p id="errorImg" class="error"></p>
+</div>
+
+<button type="button" id="btnIniciar" class="btn" hidden>Iniciar el juego</button>
+
+<!-- Juego -->
+<div id="zonaJuego" hidden>
+    <div id="tablero"></div>
+    <p id="mensaje"></p>
+</div>
+
+<script>
+    const IMAGEN_DEFECTO = '/bulbasaur.png';
+    const TAM_TABLERO = 360;      // px
+    const MIN_N = 3, MAX_N = 10;
+
+    const $ = id => document.getElementById(id);
+    const panel = $('panel'), preview = $('preview'), inputColor = $('color'),
+          inputDim = $('dimension'), errorDim = $('errorDim'), inputArchivo = $('archivo'),
+          btnSeleccionar = $('btnSeleccionar'), errorImg = $('errorImg'),
+          btnIniciar = $('btnIniciar'), zonaJuego = $('zonaJuego'),
+          divTablero = $('tablero'), mensaje = $('mensaje');
+
+    let imagenUrl = IMAGEN_DEFECTO;   // imagen que se usa para cortar las figuras
+    let tablero = null;               // arreglo de N*N textos ("1".."N*N-1" y "X")
+    let n = 0;
+    let ocupado = false;              // evita clics dobles mientras responde el servidor
+    let terminado = false;
+
+    // ---------- Utilidades ----------
+    function leerColorGuardado() {
+        try { return localStorage.getItem('stfColor'); } catch (e) { return null; }
+    }
+    function guardarColor(c) {
+        try { localStorage.setItem('stfColor', c); } catch (e) { /* sin almacenamiento */ }
+    }
+
+    /** Valida el formato NxN. Devuelve N o -1. */
+    function leerDimension(texto) {
+        const m = /^(\d{1,2})x(\d{1,2})$/.exec(texto.trim());
+        if (!m) return -1;
+        const f = parseInt(m[1], 10), c = parseInt(m[2], 10);
+        if (f !== c || f < MIN_N || f > MAX_N) return -1;
+        return f;
+    }
+
+    async function postForm(url, datos) {
+        const resp = await fetch(url, { method: 'POST', body: datos });
+        let json = {};
+        try { json = await resp.json(); } catch (e) { /* respuesta vacia */ }
+        if (!resp.ok) throw new Error(json.error || 'Error del servidor (' + resp.status + ')');
+        return json;
+    }
+
+    /** Carga la imagen guardada en la BD (o la de por defecto) sin recargar la pagina. */
+    async function cargarImagen(tieneImagen) {
+        let nuevaUrl = IMAGEN_DEFECTO;
+        if (tieneImagen) {
+            try {
+                const resp = await fetch('/api/imagen', { cache: 'no-store' });
+                if (resp.ok) nuevaUrl = URL.createObjectURL(await resp.blob());
+            } catch (e) { /* se queda la imagen por defecto */ }
+        }
+        if (imagenUrl.startsWith('blob:')) URL.revokeObjectURL(imagenUrl);
+        imagenUrl = nuevaUrl;
+        preview.src = imagenUrl;
+    }
+
+    // ---------- Configuracion ----------
+    function validarDimension() {
+        const texto = inputDim.value;
+        if (texto.trim() === '') {
+            errorDim.textContent = 'Las dimensiones del tablero son obligatorias (ej. 3x3).';
+            inputDim.classList.add('invalido');
+            btnIniciar.hidden = true;
+            return;
+        }
+        if (leerDimension(texto) === -1) {
+            errorDim.textContent = 'Formato inválido. Use NxN, con N entre ' + MIN_N + ' y ' + MAX_N + ' (ej. 3x3).';
+            inputDim.classList.add('invalido');
+            btnIniciar.hidden = true;
+            return;
+        }
+        errorDim.textContent = '';
+        inputDim.classList.remove('invalido');
+        btnIniciar.hidden = false;   // aparece automaticamente solo si es valido
+    }
+    inputDim.addEventListener('input', validarDimension);
+
+    inputColor.addEventListener('input', () => {
+        guardarColor(inputColor.value);
+        if (tablero) dibujarTablero();
+    });
+
+    btnSeleccionar.addEventListener('click', () => inputArchivo.click());
+
+    inputArchivo.addEventListener('change', async () => {
+        const archivo = inputArchivo.files[0];
+        inputArchivo.value = '';
+        if (!archivo) return;
+        const nombre = archivo.name.toLowerCase();
+        const esJpg = (nombre.endsWith('.jpg') || nombre.endsWith('.jpeg')) && archivo.type === 'image/jpeg';
+        if (!esJpg) {
+            errorImg.textContent = 'Solo se permiten imágenes en formato JPG.';
+            return;
+        }
+        errorImg.textContent = '';
+        btnSeleccionar.disabled = true;
+        try {
+            const datos = new FormData();
+            datos.append('archivo', archivo);
+            await postForm('/api/imagen', datos);
+            await cargarImagen(true);           // se actualiza sin recargar la pagina
+        } catch (e) {
+            errorImg.textContent = e.message;
+        } finally {
+            btnSeleccionar.disabled = false;
+        }
+    });
+
+    btnIniciar.addEventListener('click', async () => {
+        if (leerDimension(inputDim.value) === -1) { validarDimension(); return; }
+        btnIniciar.disabled = true;
+        try {
+            const datos = new FormData();
+            datos.append('dimension', inputDim.value.trim());
+            const estado = await postForm('/api/juego/iniciar', datos);
+            mostrarJuego(estado);
+        } catch (e) {
+            errorDim.textContent = e.message;
+        } finally {
+            btnIniciar.disabled = false;
+        }
+    });
+
+    // ---------- Juego ----------
+    function mostrarJuego(estado) {
+        tablero = estado.tablero;
+        n = estado.n;
+        terminado = false;
+        mensaje.textContent = '';
+        panel.hidden = true;
+        btnIniciar.hidden = true;
+        zonaJuego.hidden = false;
+        dibujarTablero();
+    }
+
+    function sonContiguas(a, b) {
+        return Math.abs(Math.floor(a / n) - Math.floor(b / n)) + Math.abs(a % n - b % n) === 1;
+    }
+
+    function dibujarTablero() {
+        const tam = Math.floor(TAM_TABLERO / n);
+        const total = tam * n;
+        const vacio = tablero.indexOf('X');
+        divTablero.style.gridTemplateColumns = `repeat(${n}, ${tam}px)`;
+        divTablero.style.backgroundColor = inputColor.value;
+        divTablero.innerHTML = '';
+
+        tablero.forEach((valor, pos) => {
+            const casilla = document.createElement('div');
+            casilla.className = 'casilla';
+            casilla.style.width = tam + 'px';
+            casilla.style.height = tam + 'px';
+            if (valor === 'X') {
+                casilla.style.backgroundColor = inputColor.value;   // color del tablero
+            } else {
+                const original = parseInt(valor, 10) - 1;          // posicion en la imagen original
+                const fila = Math.floor(original / n), col = original % n;
+                casilla.style.backgroundImage = `url("${imagenUrl}")`;
+                casilla.style.backgroundSize = `${total}px ${total}px`;
+                casilla.style.backgroundPosition = `-${col * tam}px -${fila * tam}px`;
+                if (!terminado && sonContiguas(pos, vacio)) casilla.classList.add('movible');
+                casilla.addEventListener('click', () => mover(pos, casilla));
+            }
+            divTablero.appendChild(casilla);
+        });
+    }
+
+    async function mover(pos, casilla) {
+        if (ocupado || terminado) return;
+        // Solo se pueden mover figuras contiguas al espacio vacio
+        if (!sonContiguas(pos, tablero.indexOf('X'))) {
+            casilla.classList.remove('no-valida');
+            void casilla.offsetWidth;
+            casilla.classList.add('no-valida');
+            return;
+        }
+        ocupado = true;
+        try {
+            const datos = new FormData();
+            datos.append('posicion', pos);
+            const estado = await postForm('/api/juego/mover', datos);
+            tablero = estado.tablero;
+            terminado = estado.terminado;
+            dibujarTablero();
+            if (terminado) {
+                mensaje.textContent = 'Juego terminado !';
+                // Nuevo juego en el frontend (la BD ya se reinicio en el servidor)
+                setTimeout(nuevoJuego, 4000);
+            }
+        } catch (e) {
+            mensaje.textContent = e.message;
+            setTimeout(() => { if (!terminado) mensaje.textContent = ''; }, 2500);
+        } finally {
+            ocupado = false;
+        }
+    }
+
+    async function nuevoJuego() {
+        tablero = null;
+        n = 0;
+        terminado = false;
+        divTablero.innerHTML = '';
+        mensaje.textContent = '';
+        zonaJuego.hidden = true;
+        inputDim.value = '';
+        errorDim.textContent = '';
+        errorImg.textContent = '';
+        inputDim.classList.remove('invalido');
+        btnIniciar.hidden = true;
+        panel.hidden = false;
+        await cargarImagen(false);   // vuelve la imagen por defecto
+    }
+
+    // ---------- Al abrir la pagina: retomar el juego si quedo uno en la BD ----------
+    (async function iniciar() {
+        const color = leerColorGuardado();
+        if (color) inputColor.value = color;
+        try {
+            const resp = await fetch('/api/estado', { cache: 'no-store' });
+            const estado = await resp.json();
+            await cargarImagen(estado.tieneImagen);
+            if (estado.tablero) {
+                inputDim.value = estado.n + 'x' + estado.n;
+                mostrarJuego(estado);
+            }
+        } catch (e) {
+            errorImg.textContent = 'No se pudo conectar con el servidor.';
+        }
+    })();
+</script>
+</body>
+</html>
